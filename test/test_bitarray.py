@@ -551,6 +551,21 @@ class SliceTests(unittest.TestCase, Util):
                           slice(None, 2, None), -1)
 
 
+    def test_setlist_to_bool(self):
+        a = bitarray('11111111')
+        a.setlist([0, 2, 4, 6], False)  
+        self.assertEqual(a, bitarray('01010101'))
+        a.setlist([0, 4], True)  
+        self.assertEqual(a, bitarray('11011101'))
+
+    def test_setlist_to_int(self):
+        a = bitarray('11111111')
+        a.setlist([0, 2, 4, 6], 0)  
+        self.assertEqual(a, bitarray('01010101'))
+        a.setlist([0, 4], 1)  
+        self.assertEqual(a, bitarray('11011101'))
+
+
     def test_delitem1(self):
         a = bitarray('100110')
         del a[1]
@@ -1365,6 +1380,19 @@ class MethodTests(unittest.TestCase, Util):
             self.assertEqual(list(a.itersearch(b)), res)
             self.assertEqual([p for p in a.itersearch(b)], res)
 
+    def test_search4(self):
+        ba = bitarray('0011001100110011')
+        for inc in [1, 2, 3, 4, 5, 6]:
+            pos = -1
+            res = list()
+            while True:
+                match = ba.search(bitarray('11'), inc, pos)
+                if not match:
+                    break
+                res += match
+                pos  = match[-1] + 1
+            self.assertEqual([2, 6, 10, 14], res), inc
+        self.assertEqual([], ba.search(bitarray('11'), 1, len(ba)+1))
 
     def test_fill(self):
         a = bitarray('')
