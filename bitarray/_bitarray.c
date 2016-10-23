@@ -345,13 +345,6 @@ repeat(bitarrayobject *self, idx_t n)
     return 0;
 }
 
-
-enum op_type {
-    OP_and,
-    OP_or,
-    OP_xor,
-};
-
 /* set the bits from start to stop (excluding) in self to val */
 static void
 setrange(bitarrayobject *self, idx_t start, idx_t stop, int val)
