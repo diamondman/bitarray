@@ -4,6 +4,11 @@
 
    Author: Ilan Schnell
 */
+#define HAS_VECTORS (defined(__GNUC__) || defined(__clang__))
+
+#if HAS_VECTORS
+typedef char vec __attribute__((vector_size(16)));
+#endif
 
 #define PY_SSIZE_T_CLEAN
 #include "Python.h"
@@ -87,12 +92,25 @@ static PyTypeObject Bitarraytype;
 
 #define BYTES(bits)  (((bits) == 0) ? 0 : (((bits) - 1) / 8 + 1))
 
-#define BITMASK(endian, i)  (((char) 1) << ((endian) ? (7 - (i)%8) : (i)%8))
+#define BITMASK(endian, i)  (((unsigned char) 1) << ((endian) ? (7 - (i)%8) : (i)%8))
 
 /* ------------ low level access to bits in bitarrayobject ------------- */
 
 #define GETBIT(self, i)  \
     ((self)->ob_item[(i) / 8] & BITMASK((self)->endian, i) ? 1 : 0)
+
+#if HAS_VECTORS
+/*
+ * Perform bitwise operation OP on 16 bytes of memory at a time.
+ */
+#define vector_op(A, B, OP) do {  \
+    vec __a, __b, __r;            \
+    memcpy(&__a, A, sizeof(vec)); \
+    memcpy(&__b, B, sizeof(vec)); \
+    __r = __a OP __b;             \
+    memcpy(A, &__r, sizeof(vec)); \
+} while(0);
+#endif
 
 static void
 setbit(bitarrayobject *self, idx_t i, int bit)
@@ -327,50 +345,6 @@ repeat(bitarrayobject *self, idx_t n)
     return 0;
 }
 
-
-enum op_type {
-    OP_and,
-    OP_or,
-    OP_xor,
-};
-
-/* perform bitwise operation */
-static int
-bitwise(bitarrayobject *self, PyObject *arg, enum op_type oper)
-{
-    bitarrayobject *other;
-    Py_ssize_t i;
-
-    if (!bitarray_Check(arg)) {
-        PyErr_SetString(PyExc_TypeError,
-                        "bitarray object expected for bitwise operation");
-        return -1;
-    }
-    other = (bitarrayobject *) arg;
-    if (self->nbits != other->nbits) {
-        PyErr_SetString(PyExc_ValueError,
-               "bitarrays of equal length expected for bitwise operation");
-        return -1;
-    }
-    setunused(self);
-    setunused(other);
-    switch (oper) {
-    case OP_and:
-        for (i = 0; i < Py_SIZE(self); i++)
-            self->ob_item[i] &= other->ob_item[i];
-        break;
-    case OP_or:
-        for (i = 0; i < Py_SIZE(self); i++)
-            self->ob_item[i] |= other->ob_item[i];
-        break;
-    case OP_xor:
-        for (i = 0; i < Py_SIZE(self); i++)
-            self->ob_item[i] ^= other->ob_item[i];
-        break;
-    }
-    return 0;
-}
-
 /* set the bits from start to stop (excluding) in self to val */
 idx_t
 setrange(bitarrayobject *self, idx_t start, idx_t stop, int val)
@@ -548,7 +522,7 @@ append_item(bitarrayobject *self, PyObject *item)
 }
 
 static PyObject *
-unpack(bitarrayobject *self, char zero, char one)
+unpack(bitarrayobject *self, unsigned char zero, unsigned char one)
 {
     PyObject *res;
     Py_ssize_t i;
@@ -1713,7 +1687,7 @@ use the extend method.");
 static PyObject *
 bitarray_unpack(bitarrayobject *self, PyObject *args, PyObject *kwds)
 {
-    char zero = 0x00, one = 0xff;
+    unsigned char zero = 0x00, one = 0xff;
     static char* kwlist[] = {"zero", "one", NULL};
 
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "|cc:unpack", kwlist,
@@ -2123,38 +2097,101 @@ bitarray_cpinvert(bitarrayobject *self)
     return res;
 }
 
-#define BITWISE_FUNC(oper)  \
+#if HAS_VECTORS
+#define BITWISE_FUNC_INTERNAL(SELF, OTHER, OP, OPEQ) do {   \
+    Py_ssize_t i = 0;                                       \
+    const Py_ssize_t size = Py_SIZE(SELF);                  \
+    char* self_ob_item = (SELF)->ob_item;                   \
+    const char* other_ob_item = (OTHER)->ob_item;           \
+                                                            \
+    for (; i + sizeof(vec) < size; i += sizeof(vec)) {      \
+        vector_op(self_ob_item + i, other_ob_item + i, OP); \
+    }                                                       \
+                                                            \
+    for (; i < size; ++i) {                                 \
+        self_ob_item[i] OPEQ other_ob_item[i];              \
+    }                                                       \
+} while(0);
+#else
+#define BITWISE_FUNC_INTERNAL(SELF, OTHER, OP, OPEQ) do { \
+    Py_ssize_t i;                                         \
+    const Py_ssize_t size = Py_SIZE(SELF);                \
+                                                          \
+    for (i = 0; i < size; ++i) {                          \
+        (SELF)->ob_item[i] OPEQ (OTHER)->ob_item[i];      \
+    }                                                     \
+} while(0);
+#endif
+
+/*
+ * Generate function that performs bitwise operations.
+ **/
+#define BITWISE_FUNC(OPNAME, OP, OPEQ)                                 \
+static int bitwise_ ## OPNAME (bitarrayobject *self, PyObject *arg)    \
+{                                                                      \
+    bitarrayobject *other;                                             \
+                                                                       \
+    if (!bitarray_Check(arg)) {                                        \
+        PyErr_SetString(PyExc_TypeError,                               \
+          "bitarray object expected for bitwise operation");           \
+        return -1;                                                     \
+    }                                                                  \
+                                                                       \
+    other = (bitarrayobject *) arg;                                    \
+                                                                       \
+    if (self->nbits != other->nbits) {                                 \
+        PyErr_SetString(PyExc_ValueError,                              \
+          "bitarrays of equal length expected for bitwise operation"); \
+        return -1;                                                     \
+    }                                                                  \
+                                                                       \
+    setunused(self);                                                   \
+    setunused(other);                                                  \
+                                                                       \
+    BITWISE_FUNC_INTERNAL(self, other, OP, OPEQ);                      \
+                                                                       \
+    return 0;                                                          \
+}
+
+BITWISE_FUNC(xor, ^, ^=)
+BITWISE_FUNC(and, &, &=)
+BITWISE_FUNC(or, |, |=)
+
+#define BITARRAY_FUNC(oper)  \
 static PyObject *                                                   \
 bitarray_ ## oper (bitarrayobject *self, PyObject *other)           \
 {                                                                   \
     PyObject *res;                                                  \
                                                                     \
     res = bitarray_copy(self);                                      \
-    if (bitwise((bitarrayobject *) res, other, OP_ ## oper) < 0) {  \
+                                                                    \
+    if (bitwise_ ## oper((bitarrayobject *) res, other) < 0) {      \
         Py_DECREF(res);                                             \
         return NULL;                                                \
     }                                                               \
+                                                                    \
     return res;                                                     \
 }
 
-BITWISE_FUNC(and)
-BITWISE_FUNC(or)
-BITWISE_FUNC(xor)
+BITARRAY_FUNC(and)
+BITARRAY_FUNC(or)
+BITARRAY_FUNC(xor)
 
 
-#define BITWISE_IFUNC(oper)  \
+#define BITARRAY_IFUNC(oper)  \
 static PyObject *                                            \
 bitarray_i ## oper (bitarrayobject *self, PyObject *other)   \
 {                                                            \
-    if (bitwise(self, other, OP_ ## oper) < 0)               \
+    if (bitwise_ ## oper(self, other) < 0)                   \
         return NULL;                                         \
+                                                             \
     Py_INCREF(self);                                         \
     return (PyObject *) self;                                \
 }
 
-BITWISE_IFUNC(and)
-BITWISE_IFUNC(or)
-BITWISE_IFUNC(xor)
+BITARRAY_IFUNC(and)
+BITARRAY_IFUNC(or)
+BITARRAY_IFUNC(xor)
 
 /******************* variable length encoding and decoding ***************/
 
